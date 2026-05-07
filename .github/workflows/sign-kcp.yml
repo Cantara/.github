@@ -1,0 +1,54 @@
+name: Sign KCP Manifest (reusable)
+
+# Reusable workflow — call from any Cantara repo that ships a knowledge.yaml.
+# Requires KCP_SIGNING_KEY secret (org-level or repo-level, base64-encoded Ed25519 private key).
+# Public key: https://wiki.cantara.no/.well-known/kcp-signing-key.pub
+
+on:
+  workflow_call:
+
+jobs:
+  sign:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Check for knowledge.yaml
+        id: check
+        run: |
+          if [ ! -f knowledge.yaml ]; then
+            echo "No knowledge.yaml found — skipping"
+            echo "skip=true" >> $GITHUB_OUTPUT
+          else
+            echo "skip=false" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Sign knowledge.yaml
+        if: steps.check.outputs.skip == 'false'
+        env:
+          KCP_SIGNING_KEY: ${{ secrets.KCP_SIGNING_KEY }}
+        run: |
+          echo "$KCP_SIGNING_KEY" | base64 -d > /tmp/kcp-signing.pem
+          openssl pkeyutl -sign -rawin \
+            -inkey /tmp/kcp-signing.pem \
+            -in knowledge.yaml \
+            | base64 -w0 > knowledge.yaml.sig
+          shred -u /tmp/kcp-signing.pem
+
+      - name: Commit signature
+        if: steps.check.outputs.skip == 'false'
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          if git diff --quiet knowledge.yaml.sig 2>/dev/null && git ls-files --error-unmatch knowledge.yaml.sig 2>/dev/null; then
+            echo "Signature unchanged — nothing to commit"
+            exit 0
+          fi
+          git add knowledge.yaml.sig
+          git commit -m "chore(kcp): update knowledge.yaml.sig [skip-sign]" || echo "Nothing to commit"
+          git push
