@@ -1,0 +1,13 @@
+name: Sign Own KCP Manifest
+
+# This repo hosts the reusable sign-kcp.yml (workflow_call only), so it needs
+# its own caller under a different filename to sign its own knowledge.yaml.
+on:
+  push:
+    branches: [main, master]
+    paths: [knowledge.yaml]
+
+jobs:
+  sign:
+    uses: Cantara/.github/.github/workflows/sign-kcp.yml@main
+    secrets: inherit
