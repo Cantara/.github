@@ -3,9 +3,40 @@ name: Sign KCP Manifest (reusable)
 # Reusable workflow — call from any Cantara repo that ships a knowledge.yaml.
 # Requires KCP_SIGNING_KEY secret (org-level or repo-level, base64-encoded Ed25519 private key).
 # Public key: https://wiki.cantara.no/.well-known/kcp-signing-key.pub
+#
+# Signs with the KCP CLI, which writes the detached envelope RFC-0018 §4.2 describes:
+#
+#   { key_id, algorithm: "EdDSA", public_key: <base64 DER SPKI>, signature: <base64> }
+#
+# This workflow previously signed with raw `openssl pkeyutl` and wrote a bare base64
+# blob — a different detached profile, predating `kcp sign`, that the toolchain cannot
+# read. `kcp render` refuses every manifest signed that way with
+# "tier=failed (unparseable signature file)". Five repos were in that state.
+#
+# The two fields the blob dropped are the ones that carry the guarantee: `key_id` is
+# the join key RFC-0018 names against the consumer allowlist, and `public_key` is what
+# lets a consumer verify without already knowing which key signed. A bare signature can
+# only be checked by someone who already has the answer.
 
 on:
   workflow_call:
+    inputs:
+      key_id:
+        description: >-
+          Allowlist join key recorded in the signature (RFC-0018 §9). Must match the id
+          consumers have allowlisted for this key, or verification fails despite a
+          mathematically valid signature.
+        type: string
+        required: false
+        default: cantara-repos-2026
+      cli_version:
+        description: >-
+          Version range of @cantara.no/kcp used to sign. Pinned rather than `latest` so
+          a CLI release cannot silently change the signature envelope of every repo in
+          the org on its next manifest push.
+        type: string
+        required: false
+        default: "0.29"
 
 jobs:
   sign:
@@ -28,17 +59,40 @@ jobs:
             echo "skip=false" >> $GITHUB_OUTPUT
           fi
 
+      - uses: actions/setup-node@v4
+        if: steps.check.outputs.skip == 'false'
+        with:
+          node-version: '24'
+
       - name: Sign knowledge.yaml
         if: steps.check.outputs.skip == 'false'
         env:
           KCP_SIGNING_KEY: ${{ secrets.KCP_SIGNING_KEY }}
+          KEY_ID: ${{ inputs.key_id }}
+          CLI_VERSION: ${{ inputs.cli_version }}
         run: |
+          set -euo pipefail
+          umask 077
           echo "$KCP_SIGNING_KEY" | base64 -d > /tmp/kcp-signing.pem
-          openssl pkeyutl -sign -rawin \
-            -inkey /tmp/kcp-signing.pem \
-            -in knowledge.yaml \
-            | base64 -w0 > knowledge.yaml.sig
-          shred -u /tmp/kcp-signing.pem
+          # shred on EXIT rather than only after a successful sign: the previous
+          # version left the decoded private key on the runner if signing failed.
+          trap 'shred -u /tmp/kcp-signing.pem 2>/dev/null || true' EXIT
+          npx --yes "@cantara.no/kcp@${CLI_VERSION}" sign knowledge.yaml \
+            --key /tmp/kcp-signing.pem \
+            --key-id "$KEY_ID"
+
+      - name: Verify the signature we just wrote
+        if: steps.check.outputs.skip == 'false'
+        env:
+          CLI_VERSION: ${{ inputs.cli_version }}
+        run: |
+          set -euo pipefail
+          # The failure this workflow shipped with was silent: it wrote a .sig file,
+          # committed it, and reported success, while every consumer got "unparseable
+          # signature file". Signing without reading back is how that went unnoticed
+          # for five repos — so the render pipeline, the actual consumer, checks it.
+          npx --yes "@cantara.no/kcp@${CLI_VERSION}" render knowledge.yaml > /dev/null
+          echo "signature verifies against the render pipeline"
 
       - name: Commit signature
         if: steps.check.outputs.skip == 'false'
